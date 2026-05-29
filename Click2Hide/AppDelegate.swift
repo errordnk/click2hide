@@ -79,17 +79,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func applicationDidFinishLaunching(_ aNotification: Notification) {
-        // Check for accessibility permissions
-        if !isAccessibilityEnabled() {
-            promptForAccessibilityPermission()
-        }
-
         // Set the application to be an accessory application
         NSApplication.shared.setActivationPolicy(.accessory)
 
+        // Check for accessibility permissions
+        if !isAccessibilityEnabled() {
+            promptForAccessibilityPermission()
+            return // setupEventTap will be called by the polling timer
+        }
+
+        startApp()
+    }
+
+    private func startApp() {
         // Register for ClickToHideStateChanged notifications
         NotificationCenter.default.addObserver(self, selector: #selector(updateClickToHideState(_:)), name: NSNotification.Name("ClickToHideStateChanged"), object: nil)
-
         // Start observing Dock changes.
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(self, selector: #selector(dockChanged), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
@@ -97,12 +101,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         center.addObserver(self, selector: #selector(dockChanged), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
         center.addObserver(self, selector: #selector(dockChanged), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
 
-        registerLoginItem() // Register the helper application as a login item
+        registerLoginItem()
         setupAppDict()
         setupEventTap()
-        
+
         print("Application did finish launching")
-        
+
         // Initial load of dock items
         updateDockItems()
     }
@@ -182,27 +186,114 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         for dockItem in appDelegate.dockItems {
             if dockItem.rect.contains(mouseLocation) {
                 // Log the mouse location and app name
-                print("Mouse Location: \(mouseLocation), App Name: \(dockItem.appID)")
-                if "Launchpad||Trash||Downloads".contains(dockItem.appID) {
-                    // these are not working for sure
+                print("CLICK: \(dockItem.appID) at \(mouseLocation)")
+                if "Launchpad||Downloads".contains(dockItem.appID) {
                     return Unmanaged.passUnretained(event)
                 }
+                // Trash is a Finder window — treat as Finder
+                let appID = dockItem.appID == "Trash" ? "Finder" : dockItem.appID
                 // Find the running application by name using NSWorkspace
                 let runningApps = NSWorkspace.shared.runningApplications
-                if let app = runningApps.first(where: { $0.localizedName == dockItem.appID
-                    || $0.localizedName == appDelegate.appDict[dockItem.appID] }) {
+                let foundApp = runningApps.first(where: { $0.localizedName == appID
+                    || $0.localizedName == appDelegate.appDict[appID] })
+                if let app = foundApp {
                     print("App isHidden: \(app.isHidden), isActive: \(app.isActive)")
-                    // when app is just minimized without switching focus, it's hidden but still active
-                    // there is no simple way to differentiate but good news is next click will work
-                    if !app.isActive || app.isHidden {
-                        // Use launch as app.activate() is not reliable and can't unminimize
-                        NSWorkspace.shared.launchApplication(dockItem.appID)
-                        // must be set after launchApp() to get most consistent results
+                    let axApp = AXUIElementCreateApplication(app.processIdentifier)
+                    var windowsRef: CFTypeRef?
+                    let hasWindows = AXUIElementCopyAttributeValue(
+                        axApp, kAXWindowsAttribute as CFString, &windowsRef
+                    ) == .success
+                    let windows = (windowsRef as? [AXUIElement]) ?? []
+
+                    // Check if all windows are already minimized
+                    let allMinimized = !windows.isEmpty && windows.allSatisfy { window in
+                        var minRef: CFTypeRef?
+                        AXUIElementCopyAttributeValue(
+                            window, kAXMinimizedAttribute as CFString, &minRef
+                        )
+                        return (minRef as? Bool) == true
+                    }
+
+                    let isFinder = app.bundleIdentifier == "com.apple.finder"
+                    let isTrash = dockItem.appID == "Trash"
+
+                    // Helper: open a new Finder or Trash window
+                    func openFinderWindow() {
+                        if isTrash {
+                            let trash = FileManager.default.urls(
+                                for: .trashDirectory, in: .userDomainMask
+                            ).first ?? URL(fileURLWithPath: NSHomeDirectory())
+                            NSWorkspace.shared.open(trash)
+                        } else {
+                            NSWorkspace.shared.open(
+                                URL(fileURLWithPath: NSHomeDirectory())
+                            )
+                        }
+                    }
+
+                    if isFinder && (windows.isEmpty || app.isHidden) {
                         app.unhide()
-                        app.activate()
+                        app.activate(options: .activateIgnoringOtherApps)
+                        // Re-fetch windows after unhide and raise them
+                        let pid = app.processIdentifier
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            let ax = AXUIElementCreateApplication(pid)
+                            var ref: CFTypeRef?
+                            if AXUIElementCopyAttributeValue(
+                                ax, kAXWindowsAttribute as CFString, &ref
+                            ) == .success, let wins = ref as? [AXUIElement] {
+                                for w in wins {
+                                    AXUIElementSetAttributeValue(
+                                        w, kAXMinimizedAttribute as CFString,
+                                        false as CFTypeRef
+                                    )
+                                    AXUIElementPerformAction(
+                                        w, kAXRaiseAction as CFString
+                                    )
+                                }
+                                if wins.isEmpty { openFinderWindow() }
+                            } else {
+                                openFinderWindow()
+                            }
+                        }
+                        print("Finder: unhide+activate")
+                    } else if isFinder && !windows.isEmpty && !allMinimized {
+                        // Finder visible — hide it
+                        app.hide()
+                        print("Finder: hide")
+                        shouldSuppressEvent = true
+                    } else if app.isHidden || allMinimized {
+                        // Unminimize all windows and activate
+                        app.unhide()
+                        if !isFinder {
+                            for window in windows {
+                                AXUIElementSetAttributeValue(
+                                    window,
+                                    kAXMinimizedAttribute as CFString,
+                                    false as CFTypeRef
+                                )
+                            }
+                        }
+                        app.activate(options: .activateIgnoringOtherApps)
+                        print("Restored \(windows.count) window(s): " +
+                              "\(app.localizedName ?? "Unknown")")
                     } else {
-                        let success = app.hide() // Minimize the app
-                        print("App minimized \(success): \(app.localizedName ?? "Unknown")")
+                        if hasWindows && !windows.isEmpty {
+                            // Minimize all windows via AX API
+                            for window in windows {
+                                AXUIElementSetAttributeValue(
+                                    window,
+                                    kAXMinimizedAttribute as CFString,
+                                    true as CFTypeRef
+                                )
+                            }
+                            print("Minimized \(windows.count) window(s): " +
+                                  "\(app.localizedName ?? "Unknown")")
+                        } else {
+                            app.hide()
+                            print("App hidden (fallback): " +
+                                  "\(app.localizedName ?? "Unknown")")
+                        }
                     }
                     shouldSuppressEvent = true
                 } else {
@@ -326,22 +417,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func promptForAccessibilityPermission() {
         let alert = NSAlert()
         alert.messageText = "Accessibility Permission Required"
-        alert.informativeText = 
+        alert.informativeText =
         """
-        To allow Click2Hide to control the system dock, please enable accessibility permissions for it in System Preferences.
-        
-        Please relaunch app after permission granted.
+        To allow Click2Hide to control the system dock, \
+        please enable accessibility permissions for it in System Preferences.
+
+        The app will start automatically once permission is granted.
         """
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Preferences")
+        alert.addButton(withTitle: "Open Preferences")
+        alert.addButton(withTitle: "Cancel")
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
             openAccessibilityPreferences()
-            // Quit the application as it won't work without permission
-            // Delay termination by 1 second
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                NSApplication.shared.terminate(nil)
+        }
+
+        // Poll until accessibility is granted, then start without relaunch
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
+            if self.isAccessibilityEnabled() {
+                timer.invalidate()
+                self.startApp()
             }
         }
     }
@@ -516,3 +612,4 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let tag_name: String
     }
 }
+

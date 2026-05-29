@@ -1,0 +1,54 @@
+version: '3'
+
+vars:
+  APP: Click2Hide
+  SCHEME: Click2Hide
+  PROJECT: Click2Hide.xcodeproj
+  BUILD_DIR: build/Build/Products/Release
+  INSTALL_DIR: /Applications
+
+tasks:
+  default:
+    desc: Build and install Click2Hide
+    cmds:
+      - task: install
+
+  build:
+    desc: Build Click2Hide with xcodebuild
+    sources:
+      - Click2Hide/**/*.swift
+      - Click2Hide.xcodeproj/project.pbxproj
+    cmds:
+      - xcodebuild
+          -project {{.PROJECT}}
+          -scheme {{.SCHEME}}
+          -configuration Release
+          -derivedDataPath build
+          2>&1 | tail -5
+
+  install:
+    desc: Build, sign and install (preserves TCC permissions via stable signature)
+    deps: [build]
+    vars:
+      ENTITLEMENTS: >-
+        build/Build/Intermediates.noindex/Click2Hide.build/Release/Click2Hide.build/Click2Hide.app.xcent
+    cmds:
+      - pkill -x {{.APP}} || true
+      - sleep 0.5
+      # Copy only the binary to avoid resetting TCC permissions
+      - cp {{.BUILD_DIR}}/{{.APP}}.app/Contents/MacOS/{{.APP}}
+          {{.INSTALL_DIR}}/{{.APP}}.app/Contents/MacOS/{{.APP}}
+      # Re-sign with Apple Development cert so TCC stays valid across rebuilds
+      - codesign --force --sign "Apple Development: dnk@sarnet.ru (Q69RC25TUD)"
+          --entitlements {{.ENTITLEMENTS}}
+          {{.INSTALL_DIR}}/{{.APP}}.app
+      - open {{.INSTALL_DIR}}/{{.APP}}.app
+
+  install-fresh:
+    desc: Full install (resets TCC permissions — use only on first install)
+    deps: [build]
+    cmds:
+      - pkill -x {{.APP}} || true
+      - sleep 0.5
+      - cp -r {{.BUILD_DIR}}/{{.APP}}.app {{.INSTALL_DIR}}/
+      - open {{.INSTALL_DIR}}/{{.APP}}.app

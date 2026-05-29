@@ -6,6 +6,8 @@
 	<string>True</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>This app requires access to control System Events to retrieve dock information.</string>
+	<key>LSUIElement</key>
+	<true/>
 	<key>CFBundleName</key>
 	<string>Click2Hide</string>
 	<key>LSApplicationCategory</key>
