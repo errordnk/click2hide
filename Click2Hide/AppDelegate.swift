@@ -197,7 +197,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let foundApp = runningApps.first(where: { $0.localizedName == appID
                     || $0.localizedName == appDelegate.appDict[appID] })
                 if let app = foundApp {
-                    print("App isHidden: \(app.isHidden), isActive: \(app.isActive)")
+                    print("APP: \(appID) " +
+                          "isFinder=\(app.bundleIdentifier == "com.apple.finder") " +
+                          "isTrash=\(dockItem.appID == "Trash") " +
+                          "isHidden=\(app.isHidden)")
                     let axApp = AXUIElementCreateApplication(app.processIdentifier)
                     var windowsRef: CFTypeRef?
                     let hasWindows = AXUIElementCopyAttributeValue(
@@ -226,26 +229,80 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
                     let isFinder = app.bundleIdentifier == "com.apple.finder"
                     let isTrash = dockItem.appID == "Trash"
+                    let home = NSHomeDirectory()
 
-                    // Helper: open a new Finder or Trash window
-                    func openFinderWindow() {
-                        DispatchQueue.main.async {
-                            if isTrash {
-                                if let trash = FileManager.default.urls(
-                                    for: .trashDirectory, in: .userDomainMask
-                                ).first {
-                                    NSWorkspace.shared.open(trash)
-                                }
-                            } else {
-                                NSWorkspace.shared.open(
-                                    URL(fileURLWithPath: NSHomeDirectory())
-                                )
-                            }
+                    // Find Trash window among Finder windows by title
+                    func findTrashWindow(_ wins: [AXUIElement]) -> AXUIElement? {
+                        return wins.first { w in
+                            var titleRef: CFTypeRef?
+                            AXUIElementCopyAttributeValue(
+                                w, kAXTitleAttribute as CFString, &titleRef
+                            )
+                            let title = titleRef as? String ?? ""
+                            return title == "Trash" || title == "Корзина"
                         }
                     }
 
-                    if isFinder && app.isHidden {
-                        // Finder is hidden — unhide and raise all windows
+                    if isTrash {
+                        // Trash: show/hide only the Trash window
+                        if app.isHidden {
+                            app.unhide()
+                            app.activate(options: .activateIgnoringOtherApps)
+                            let pid = app.processIdentifier
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                let ax = AXUIElementCreateApplication(pid)
+                                var ref: CFTypeRef?
+                                AXUIElementCopyAttributeValue(
+                                    ax, kAXWindowsAttribute as CFString, &ref
+                                )
+                                let wins = (ref as? [AXUIElement]) ?? []
+                                if let tw = findTrashWindow(wins) {
+                                    AXUIElementSetAttributeValue(
+                                        tw, kAXMinimizedAttribute as CFString,
+                                        false as CFTypeRef
+                                    )
+                                    AXUIElementPerformAction(
+                                        tw, kAXRaiseAction as CFString
+                                    )
+                                } else {
+                                    var err: NSDictionary?
+                                    NSAppleScript(
+                                        source: "tell application \"Finder\" to open trash"
+                                    )?.executeAndReturnError(&err)
+                                }
+                            }
+                        } else if let tw = findTrashWindow(windows) {
+                            // Trash window exists — toggle it
+                            var minRef: CFTypeRef?
+                            AXUIElementCopyAttributeValue(
+                                tw, kAXMinimizedAttribute as CFString, &minRef
+                            )
+                            let isMin = (minRef as? Bool) == true
+                            if isMin {
+                                AXUIElementSetAttributeValue(
+                                    tw, kAXMinimizedAttribute as CFString,
+                                    false as CFTypeRef
+                                )
+                                AXUIElementPerformAction(tw, kAXRaiseAction as CFString)
+                                app.activate(options: .activateIgnoringOtherApps)
+                            } else {
+                                AXUIElementSetAttributeValue(
+                                    tw, kAXMinimizedAttribute as CFString,
+                                    true as CFTypeRef
+                                )
+                            }
+                            shouldSuppressEvent = true
+                        } else {
+                            // No trash window — open it
+                            app.activate(options: .activateIgnoringOtherApps)
+                            var err: NSDictionary?
+                            NSAppleScript(
+                                source: "tell application \"Finder\" to open trash"
+                            )?.executeAndReturnError(&err)
+                        }
+                        shouldSuppressEvent = true
+                    } else if isFinder && app.isHidden {
+                        // Finder hidden — unhide and raise all windows
                         app.unhide()
                         app.activate(options: .activateIgnoringOtherApps)
                         let pid = app.processIdentifier
@@ -260,26 +317,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                                         w, kAXMinimizedAttribute as CFString,
                                         false as CFTypeRef
                                     )
-                                    AXUIElementPerformAction(
-                                        w, kAXRaiseAction as CFString
+                                    AXUIElementPerformAction(w, kAXRaiseAction as CFString)
+                                }
+                                if wins.isEmpty {
+                                    NSWorkspace.shared.open(
+                                        URL(fileURLWithPath: NSHomeDirectory())
                                     )
                                 }
-                                if wins.isEmpty { openFinderWindow() }
                             } else {
-                                openFinderWindow()
+                                NSWorkspace.shared.open(
+                                    URL(fileURLWithPath: NSHomeDirectory())
+                                )
                             }
                         }
+                        shouldSuppressEvent = true
                         print("Finder: unhide+activate")
                     } else if isFinder && windows.isEmpty {
-                        // Finder running but no windows — open new one
+                        // Finder running but no windows — open home
                         app.activate(options: .activateIgnoringOtherApps)
-                        openFinderWindow()
+                        NSWorkspace.shared.open(URL(fileURLWithPath: NSHomeDirectory()))
+                        shouldSuppressEvent = true
                         print("Finder: open new window")
                     } else if isFinder && !windows.isEmpty && !allMinimized {
-                        // Finder visible with windows — hide it
+                        // Finder visible — hide it
                         app.hide()
-                        print("Finder: hide")
                         shouldSuppressEvent = true
+                        print("Finder: hide")
+                    } else if isFinder && allMinimized {
+                        // All Finder windows minimized — restore them
+                        app.unhide()
+                        app.activate(options: .activateIgnoringOtherApps)
+                        for w in windows {
+                            AXUIElementSetAttributeValue(
+                                w, kAXMinimizedAttribute as CFString, false as CFTypeRef
+                            )
+                            AXUIElementPerformAction(w, kAXRaiseAction as CFString)
+                        }
+                        shouldSuppressEvent = true
+                        print("Finder: restore minimized")
                     } else if app.isHidden || allMinimized {
                         // Unminimize all windows and activate
                         app.unhide()
