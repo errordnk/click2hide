@@ -203,7 +203,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     let hasWindows = AXUIElementCopyAttributeValue(
                         axApp, kAXWindowsAttribute as CFString, &windowsRef
                     ) == .success
-                    let windows = (windowsRef as? [AXUIElement]) ?? []
+                    let allWindows = (windowsRef as? [AXUIElement]) ?? []
+
+                    // Filter to only real visible windows (exclude sheets, drawers etc)
+                    let windows = allWindows.filter { w in
+                        var roleRef: CFTypeRef?
+                        AXUIElementCopyAttributeValue(
+                            w, kAXRoleAttribute as CFString, &roleRef
+                        )
+                        let role = roleRef as? String ?? ""
+                        return role == kAXWindowRole as String
+                    }
 
                     // Check if all windows are already minimized
                     let allMinimized = !windows.isEmpty && windows.allSatisfy { window in
@@ -219,22 +229,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
                     // Helper: open a new Finder or Trash window
                     func openFinderWindow() {
-                        if isTrash {
-                            let trash = FileManager.default.urls(
-                                for: .trashDirectory, in: .userDomainMask
-                            ).first ?? URL(fileURLWithPath: NSHomeDirectory())
-                            NSWorkspace.shared.open(trash)
-                        } else {
-                            NSWorkspace.shared.open(
-                                URL(fileURLWithPath: NSHomeDirectory())
-                            )
+                        DispatchQueue.main.async {
+                            if isTrash {
+                                if let trash = FileManager.default.urls(
+                                    for: .trashDirectory, in: .userDomainMask
+                                ).first {
+                                    NSWorkspace.shared.open(trash)
+                                }
+                            } else {
+                                NSWorkspace.shared.open(
+                                    URL(fileURLWithPath: NSHomeDirectory())
+                                )
+                            }
                         }
                     }
 
-                    if isFinder && (windows.isEmpty || app.isHidden) {
+                    if isFinder && app.isHidden {
+                        // Finder is hidden — unhide and raise all windows
                         app.unhide()
                         app.activate(options: .activateIgnoringOtherApps)
-                        // Re-fetch windows after unhide and raise them
                         let pid = app.processIdentifier
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                             let ax = AXUIElementCreateApplication(pid)
@@ -257,8 +270,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             }
                         }
                         print("Finder: unhide+activate")
+                    } else if isFinder && windows.isEmpty {
+                        // Finder running but no windows — open new one
+                        app.activate(options: .activateIgnoringOtherApps)
+                        openFinderWindow()
+                        print("Finder: open new window")
                     } else if isFinder && !windows.isEmpty && !allMinimized {
-                        // Finder visible — hide it
+                        // Finder visible with windows — hide it
                         app.hide()
                         print("Finder: hide")
                         shouldSuppressEvent = true
